@@ -40,20 +40,27 @@ Safety Notes:
         """,
     )
     parser.add_argument(
+        "--version",
+        action="version",
+        version="HN-Link v2.0.0",
+    )
+    parser.add_argument(
         "--count",
         type=int,
         default=3,
         help="Number of posts to generate (default: 3)",
     )
-    parser.add_argument(
+    mode_group = parser.add_mutually_exclusive_group()
+    mode_group.add_argument(
         "--dry-run",
         action="store_true",
-        default=True,
+        default=False,
         help="Preview posts and save to pending_posts.json without posting (DEFAULT)",
     )
-    parser.add_argument(
+    mode_group.add_argument(
         "--publish",
         action="store_true",
+        default=False,
         help="Enable interactive human-in-the-loop review to publish approved posts to LinkedIn",
     )
     parser.add_argument(
@@ -204,18 +211,29 @@ Safety Notes:
             break
 
         if choice in ("y", "yes"):
+            # Atomically claim post before network call
+            if not tracker.claim_for_publishing(post["post_id"]):
+                print("  ⚠️ Notice: This post is already being published or was processed by another action. Skipping.")
+                continue
+
             print("  -> Publishing to LinkedIn...")
-            post_urn = poster.create_article_post(
-                text=post["linkedin_text"],
-                article_url=post["hn_url"],
-                article_title=post["hn_title"],
-            )
+            try:
+                post_urn = poster.create_article_post(
+                    text=post["linkedin_text"],
+                    article_url=post["hn_url"],
+                    article_title=post["hn_title"],
+                )
+            except Exception as e:
+                tracker.mark_publishing_failed(post["post_id"], f"Exception: {e}")
+                print(f"  ❌ Error publishing post to LinkedIn: {e}")
+                continue
+
             if post_urn:
-                tracker.claim_and_mark_published(post["post_id"], post_urn)
+                tracker.mark_published(post["post_id"], post_urn)
                 published_count += 1
                 print(f"  ✅ Published! Post URN: {post_urn}")
             else:
-                tracker.mark_failed(post["post_id"], "LinkedIn publication failed")
+                tracker.mark_publishing_failed(post["post_id"], "LinkedIn publication failed")
                 print("  ❌ Failed to publish post to LinkedIn.")
         elif choice in ("q", "quit"):
             print("  Quit command received. Halting publication queue.")

@@ -23,7 +23,7 @@ from config.settings import settings
 from src.content_extractor import ContentExtractor
 from src.history_tracker import HistoryTracker
 from src.hn_fetcher import HNFetcher
-from src.linkedin_poster import LinkedInPoster
+from src.linkedin_poster import LinkedInPoster, LinkedInTimeoutError
 from src.post_generator import PostGenerator
 
 app = Flask(__name__)
@@ -77,7 +77,7 @@ def require_api_auth(f):
 @app.get("/health")
 def health():
     """Public health check endpoint."""
-    return jsonify({"status": "ok"})
+    return jsonify({"status": "ok", "version": "2.0.0"})
 
 
 @app.post("/pipeline/fetch-and-generate")
@@ -149,7 +149,7 @@ def fetch_and_generate():
 @app.post("/pipeline/post-to-linkedin")
 @require_api_auth
 def post_to_linkedin():
-    """Post approved content to LinkedIn."""
+    """Post approved content to LinkedIn with atomic idempotency protection."""
     data = request.get_json(silent=True)
     if not data or "text" not in data:
         return jsonify({"error": "Missing 'text' field"}), 400
@@ -157,22 +157,58 @@ def post_to_linkedin():
     text = data["text"]
     article_url = data.get("article_url", "")
     article_title = data.get("article_title", "")
-    hn_id = data.get("hn_id", 0)
+    hn_id = int(data.get("hn_id", 0) or 0)
     hn_title = data.get("hn_title", "")
 
-    poster = LinkedInPoster()
+    tracker = HistoryTracker()
 
-    if article_url:
-        post_urn = poster.create_article_post(text, article_url, article_title)
-    else:
-        post_urn = poster.create_text_post(text)
+    # If story ID is provided, atomically claim the story before publishing
+    if hn_id > 0:
+        claimed, reason = tracker.claim_story_for_publishing(
+            hn_id=hn_id,
+            title=hn_title or article_title,
+            url=article_url,
+        )
+        if not claimed:
+            return jsonify({
+                "error": f"Conflict: Story {hn_id} has already been published or is currently being processed.",
+                "status": reason,
+                "hn_id": hn_id,
+            }), 409
+
+    poster = LinkedInPoster()
+    post_urn = None
+
+    try:
+        if article_url:
+            post_urn = poster.create_article_post(text, article_url, article_title)
+        else:
+            post_urn = poster.create_text_post(text)
+    except LinkedInTimeoutError as e:
+        if hn_id > 0:
+            tracker.mark_story_uncertain(hn_id, f"LinkedIn request timed out: {e}")
+        return jsonify({
+            "error": "Gateway Timeout: LinkedIn posting request timed out. Marked for reconciliation to prevent duplicate publishing.",
+            "status": "reconciliation_needed",
+            "hn_id": hn_id,
+        }), 504
+    except Exception as e:
+        if hn_id > 0:
+            tracker.mark_story_failed(hn_id, f"LinkedIn posting failed: {e}")
+        return jsonify({
+            "error": f"Publishing failed: {e}",
+            "hn_id": hn_id,
+        }), 500
 
     if post_urn:
-        tracker = HistoryTracker()
-        tracker.mark_posted(hn_id, hn_title, article_url, post_urn)
-        return jsonify({"status": "posted", "post_urn": post_urn})
+        if hn_id > 0:
+            tracker.mark_story_published(hn_id, hn_title or article_title, article_url, post_urn)
+        return jsonify({"status": "posted", "post_urn": post_urn, "hn_id": hn_id})
 
-    return jsonify({"error": "Failed to post to LinkedIn"}), 500
+    # Definite non-timeout failure
+    if hn_id > 0:
+        tracker.mark_story_failed(hn_id, "LinkedIn UGC API post creation failed")
+    return jsonify({"error": "Failed to post to LinkedIn", "hn_id": hn_id}), 500
 
 
 if __name__ == "__main__":

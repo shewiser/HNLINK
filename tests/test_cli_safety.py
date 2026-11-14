@@ -6,6 +6,8 @@ Verifies:
 - Non-interactive environments reject direct publishing attempts (fail closed).
 - Interactive mode requires individual approval per post.
 - Skipped or rejected posts are not published.
+- Conflicting --publish and --dry-run flags are rejected by mutually exclusive group.
+- --version displays version and exits cleanly.
 """
 
 import io
@@ -23,11 +25,15 @@ class TestCliSafety(unittest.TestCase):
     def setUp(self):
         self.temp_dir = tempfile.mkdtemp()
         self.db_path = os.path.join(self.temp_dir, "test_cli.db")
+        self._orig_db_path = os.environ.get("HN_LINK_DB_PATH")
         os.environ["HN_LINK_DB_PATH"] = self.db_path
         self.tracker = HistoryTracker(db_path=self.db_path)
 
     def tearDown(self):
-        os.environ.pop("HN_LINK_DB_PATH", None)
+        if self._orig_db_path is not None:
+            os.environ["HN_LINK_DB_PATH"] = self._orig_db_path
+        else:
+            os.environ.pop("HN_LINK_DB_PATH", None)
 
     @patch("scripts.run_pipeline.HNFetcher")
     @patch("scripts.run_pipeline.ContentExtractor")
@@ -93,6 +99,26 @@ class TestCliSafety(unittest.TestCase):
         mock_poster_cls.return_value.create_article_post.assert_not_called()
         # Story must NOT be in posted_stories
         self.assertFalse(self.tracker.is_posted(2002))
+
+    def test_conflicting_publish_and_dry_run_flags_rejected(self):
+        """Passing both --publish and --dry-run must be rejected by argparse mutually exclusive group."""
+        test_args = ["run_pipeline.py", "--publish", "--dry-run"]
+        with patch.object(sys, "argv", test_args):
+            with patch("sys.stderr", new_callable=io.StringIO) as mock_err:
+                with self.assertRaises(SystemExit) as cm:
+                    main()
+                self.assertEqual(cm.exception.code, 2)
+                self.assertIn("not allowed with argument", mock_err.getvalue())
+
+    def test_cli_version_flag(self):
+        """Passing --version outputs the application identity and exits cleanly."""
+        test_args = ["run_pipeline.py", "--version"]
+        with patch.object(sys, "argv", test_args):
+            with patch("sys.stdout", new_callable=io.StringIO) as mock_out:
+                with self.assertRaises(SystemExit) as cm:
+                    main()
+                self.assertEqual(cm.exception.code, 0)
+                self.assertIn("HN-Link v2.0.0", mock_out.getvalue())
 
 
 if __name__ == "__main__":

@@ -34,7 +34,7 @@ from config.settings import settings
 from src.content_extractor import ContentExtractor
 from src.history_tracker import HistoryTracker
 from src.hn_fetcher import HNFetcher
-from src.linkedin_poster import LinkedInPoster
+from src.linkedin_poster import LinkedInPoster, LinkedInTimeoutError
 from src.post_generator import PostGenerator
 
 logging.basicConfig(
@@ -309,14 +309,21 @@ async def fetch_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle inline button presses (approve/skip) with authorization and replay protection."""
+    """Handle inline button presses (approve/skip) with authorization and atomic state transitions."""
     query = update.callback_query
-    await query.answer()
 
-    # 1. Verify authorization for callback query
+    # 1. Verify authorization first and answer callback query exactly once
     if not is_authorized(update):
-        await query.answer("⛔ Unauthorized: You do not have permission to approve or skip posts.", show_alert=True)
+        try:
+            await query.answer("⛔ Unauthorized: You do not have permission to approve or skip posts.", show_alert=True)
+        except Exception as e:
+            logger.debug("Failed to send unauthorized alert: %s", e)
         return
+
+    try:
+        await query.answer()
+    except Exception as e:
+        logger.debug("Callback query already answered or expired: %s", e)
 
     data = query.data or ""
     if ":" not in data:
@@ -332,52 +339,72 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.message.reply_text("⚠️ Post record not found in database.")
         return
 
-    # Check status for replay protection
-    if post["status"] != "pending":
-        await query.edit_message_reply_markup(reply_markup=None)
-        await query.message.reply_text(f"⚠️ This post has already been processed (status: {post['status']}).")
-        return
-
     if action == "skip":
         success = tracker.claim_and_mark_skipped(post_id)
         await query.edit_message_reply_markup(reply_markup=None)
         if success:
             await query.message.reply_text(f"⏭️ Skipped: {post['hn_title'][:50]}...")
         else:
-            await query.message.reply_text("⚠️ Post was already processed by another action.")
+            await query.message.reply_text(f"⚠️ Post was already processed (status: {post.get('status', 'unknown')}).")
         return
 
     if action == "approve":
+        # Atomically transition: pending/failed -> publishing BEFORE calling external API
+        claimed = tracker.claim_for_publishing(post_id)
+        if not claimed:
+            # Immediate rejection for duplicate or concurrent clicks
+            await query.edit_message_reply_markup(reply_markup=None)
+            fresh_post = tracker.get_pending_post(post_id)
+            current_status = fresh_post.get("status") if fresh_post else "unknown"
+            if current_status == "publishing":
+                await query.message.reply_text("⚠️ Post is currently being published by another administrator. Please wait.")
+            elif current_status == "published":
+                await query.message.reply_text("⚠️ Post has already been published to LinkedIn.")
+            elif current_status == "reconciliation_needed":
+                await query.message.reply_text("⚠️ Post is in 'reconciliation_needed' state due to a prior timeout. Check LinkedIn feed directly.")
+            else:
+                await query.message.reply_text(f"⚠️ Post cannot be published (current status: {current_status}).")
+            return
+
+        # Post is claimed. Remove buttons immediately from Telegram UI
         await query.edit_message_reply_markup(reply_markup=None)
-        await query.message.reply_text("📤 Posting to LinkedIn...")
+        await query.message.reply_text("📤 Publishing to LinkedIn...")
 
         poster = LinkedInPoster()
         post_urn = None
 
-        if post.get("image_data"):
-            post_urn = poster.create_image_post(
-                text=post["linkedin_text"],
-                image_data=post["image_data"],
-            )
-        else:
-            post_urn = poster.create_text_post(
-                text=post["linkedin_text"],
-            )
-
-        if post_urn:
-            success = tracker.claim_and_mark_published(post_id, post_urn)
-            if success:
-                await query.message.reply_text(
-                    f"✅ Successfully published to LinkedIn!\n"
-                    f"📄 {post['hn_title'][:60]}\n"
-                    f"🔗 {post_urn}"
+        try:
+            if post.get("image_data"):
+                post_urn = poster.create_image_post(
+                    text=post["linkedin_text"],
+                    image_data=post["image_data"],
                 )
             else:
-                await query.message.reply_text(
-                    f"⚠️ Published to LinkedIn ({post_urn}), but status transition was already recorded."
+                post_urn = poster.create_text_post(
+                    text=post["linkedin_text"],
                 )
+        except LinkedInTimeoutError as e:
+            tracker.mark_publishing_uncertain(post_id, f"Network timeout during LinkedIn posting: {e}")
+            await query.message.reply_text(
+                "⚠️ Network timeout occurred while contacting LinkedIn.\n"
+                "To prevent duplicate publications, the post status is set to 'reconciliation_needed'.\n"
+                "Please verify your LinkedIn feed directly before taking any further action."
+            )
+            return
+        except Exception as e:
+            tracker.mark_publishing_failed(post_id, f"Publishing exception: {e}")
+            await query.message.reply_text(f"❌ Error while publishing to LinkedIn: {e}")
+            return
+
+        if post_urn:
+            tracker.mark_published(post_id, post_urn)
+            await query.message.reply_text(
+                f"✅ Successfully published to LinkedIn!\n"
+                f"📄 {post['hn_title'][:60]}\n"
+                f"🔗 {post_urn}"
+            )
         else:
-            tracker.mark_failed(post_id, "LinkedIn UGC API post creation failed")
+            tracker.mark_publishing_failed(post_id, "LinkedIn UGC API post creation failed")
             keyboard = InlineKeyboardMarkup([
                 [
                     InlineKeyboardButton("🔄 Retry", callback_data=f"approve:{post_id}"),

@@ -1,6 +1,6 @@
 <div align="center">
 
-# 🔥 HNLINK
+# 🔥 HN-Link (v2.0.0)
 
 ### Turn Hacker News into LinkedIn Virality — On Autopilot
 
@@ -8,18 +8,19 @@
   <strong>Discover trending Hacker News stories, transform them into engaging LinkedIn posts with AI, review them in Telegram, and publish with a single tap.</strong>
 </p>
 
-[![Python](https://img.shields.io/badge/Python-3.10%2B-3776AB?style=for-the-badge\&logo=python\&logoColor=white)](https://python.org)
-[![Telegram](https://img.shields.io/badge/Telegram-Bot-26A5E4?style=for-the-badge\&logo=telegram\&logoColor=white)](https://core.telegram.org/bots)
-[![LinkedIn](https://img.shields.io/badge/LinkedIn-API-0A66C2?style=for-the-badge\&logo=linkedin\&logoColor=white)](https://developer.linkedin.com)
+[![Version](https://img.shields.io/badge/Version-2.0.0-blue?style=for-the-badge)](CHANGELOG.md)
+[![Python](https://img.shields.io/badge/Python-3.10%2B-3776AB?style=for-the-badge&logo=python&logoColor=white)](https://python.org)
+[![Telegram](https://img.shields.io/badge/Telegram-Bot-26A5E4?style=for-the-badge&logo=telegram&logoColor=white)](https://core.telegram.org/bots)
+[![LinkedIn](https://img.shields.io/badge/LinkedIn-API-0A66C2?style=for-the-badge&logo=linkedin&logoColor=white)](https://developer.linkedin.com)
 [![OpenRouter](https://img.shields.io/badge/OpenRouter-AI-7C3AED?style=for-the-badge)](https://openrouter.ai)
 [![License](https://img.shields.io/badge/License-MIT-green?style=for-the-badge)](LICENSE)
-[![HF Spaces](https://img.shields.io/badge/🤗-Deploy%20Free-yellow?style=for-the-badge)](https://huggingface.co/spaces)
 
 <p>
 <a href="#-features">Features</a> •
 <a href="#-how-it-works">Workflow</a> •
 <a href="#-getting-started">Getting Started</a> •
-<a href="#-deployment">Deployment</a> •
+<a href="UPGRADE_GUIDE.md">Upgrade Guide</a> •
+<a href="CHANGELOG.md">Changelog</a> •
 <a href="#-faq">FAQ</a>
 </p>
 
@@ -62,10 +63,12 @@ You stay in control while AI handles the repetitive work.
 * 📖 Extract complete article content
 * 🖼 Automatically download the featured image
 * 🤖 Generate high-quality LinkedIn posts with AI
-* 📱 Review posts inside Telegram
-* ✅ One-tap approval workflow
-* 💼 Publish directly to LinkedIn
-* 🚫 Prevent duplicate posts with SQLite history
+* 📱 Review posts inside Telegram with fail-closed authorization
+* ✅ One-tap atomic approval workflow (TOCTOU double-post prevention)
+* 💼 Publish directly to LinkedIn with automated 401 OAuth token refresh
+* 🚫 Prevent duplicate posts with SQLite history and atomic webhook claims
+* 🔒 Security-hardened Flask API with constant-time authentication and idempotency
+* 🛡️ Safe CLI with mutually exclusive flags and individual post confirmation
 * ⚡ Powered by OpenRouter
 * 🐳 Docker ready
 * ☁️ Free deployment on Hugging Face Spaces
@@ -262,8 +265,13 @@ python src/telegram_bot.py
 # Safe preview mode (DEFAULT - does NOT post to LinkedIn):
 python -m scripts.run_pipeline --count 3
 
+# Display version:
+python -m scripts.run_pipeline --version
+
 # Interactive review and publishing (requires [y/N] confirmation for each post):
 python -m scripts.run_pipeline --publish
+
+# Note: --publish and --dry-run are mutually exclusive. Passing both will raise an error.
 ```
 
 ### 3. Flask API Server

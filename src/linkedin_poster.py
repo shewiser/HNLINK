@@ -5,8 +5,11 @@ Features:
 - Validates credential format and presence
 - Safe verification against LinkedIn API without publishing
 - Clear diagnostics for 60-day token expiration
-- Automated refresh token exchange if refresh credentials are provided
-- Safe error handling without leaking tokens in logs
+- OAuth 2.0 refresh restricted strictly to HTTP 401 Unauthorized
+- Never attempts refresh on 400, 403, 429, 5xx, or unrelated network errors
+- Refresh token rotation persistence
+- Distinguishes ambiguous network timeouts from definitive failures
+- Safe error handling without leaking tokens or secrets in logs
 - Text-only, article link preview, and image uploads
 """
 
@@ -18,6 +21,16 @@ import requests
 from config.settings import settings
 
 logger = logging.getLogger(__name__)
+
+
+class LinkedInPublishError(Exception):
+    """Base exception for LinkedIn publishing errors."""
+    pass
+
+
+class LinkedInTimeoutError(LinkedInPublishError):
+    """Raised when an external request to LinkedIn times out, leaving the outcome ambiguous."""
+    pass
 
 
 class LinkedInPoster:
@@ -57,8 +70,8 @@ class LinkedInPoster:
     def refresh_access_token(self) -> Tuple[bool, str]:
         """
         Attempt to refresh the OAuth 2.0 access token using grant_type=refresh_token.
-        LinkedIn only supports refresh tokens if the app requested offline_access
-        and developer eligibility criteria are met.
+        Only executed when LinkedIn confirms an HTTP 401 Unauthorized response.
+        Captures and preserves rotated refresh tokens when returned.
         """
         if not self.can_refresh_token():
             return (
@@ -88,6 +101,12 @@ class LinkedInPoster:
                 if new_token:
                     self.access_token = new_token
                     self._update_session_headers()
+                    # Capture rotated refresh token if provided
+                    new_refresh = data.get("refresh_token")
+                    if new_refresh:
+                        self.refresh_token = new_refresh
+                        settings.linkedin_refresh_token = new_refresh
+                        logger.info("LinkedIn refresh token rotated and updated successfully")
                     logger.info("Successfully refreshed LinkedIn OAuth access token")
                     return (True, "Access token refreshed successfully")
             error_desc = resp.json().get("error_description", resp.text) if resp.content else "Unknown error"
@@ -124,6 +143,8 @@ class LinkedInPoster:
                 )
             else:
                 return (False, f"LinkedIn credential verification failed with status {resp.status_code}")
+        except requests.Timeout as e:
+            return (False, f"Network timeout during credential verification: {e}")
         except Exception as e:
             return (False, f"Network error during credential verification: {e}")
 
@@ -217,6 +238,9 @@ class LinkedInPoster:
             asset = reg_data["value"]["asset"]
             logger.info("LinkedIn asset upload registered successfully")
 
+        except requests.Timeout as e:
+            logger.error("LinkedIn upload registration timed out: %s", e)
+            raise LinkedInTimeoutError(f"Upload registration timed out: {e}")
         except Exception as e:
             logger.error("LinkedIn upload registration failed: %s", e)
             return None
@@ -234,6 +258,9 @@ class LinkedInPoster:
             )
             upload_resp.raise_for_status()
             logger.info("LinkedIn image binary uploaded successfully")
+        except requests.Timeout as e:
+            logger.error("LinkedIn image binary upload timed out: %s", e)
+            raise LinkedInTimeoutError(f"Image binary upload timed out: {e}")
         except Exception as e:
             logger.error("LinkedIn image binary upload failed: %s", e)
             return None
@@ -261,20 +288,34 @@ class LinkedInPoster:
         return self._post_with_retry(payload)
 
     def _post_with_retry(self, payload: dict) -> Optional[str]:
-        """Send UGC post with automatic token refresh attempt on 401 if refresh is configured."""
-        urn = self._post(payload)
-        if urn is None and self.can_refresh_token():
-            logger.info("Publishing failed; attempting automated OAuth token refresh...")
+        """
+        Send UGC post with strictly targeted OAuth token refresh ONLY upon confirmed 401.
+        Never refreshes for 400, 403, 429, 5xx, or network errors.
+        Retries at most once.
+        """
+        urn, status_code, is_timeout = self._post(payload)
+        if is_timeout:
+            raise LinkedInTimeoutError("LinkedIn UGC posting request timed out (ambiguous outcome)")
+
+        if status_code == 401 and self.can_refresh_token():
+            logger.info("Confirmed HTTP 401 Unauthorized; attempting automated OAuth token refresh...")
             success, msg = self.refresh_access_token()
             if success:
-                logger.info("Retrying post submission after token refresh...")
-                return self._post(payload)
+                logger.info("Retrying post submission once after successful token refresh...")
+                urn, status_code, is_timeout = self._post(payload)
+                if is_timeout:
+                    raise LinkedInTimeoutError("LinkedIn UGC posting retry timed out (ambiguous outcome)")
+                return urn
             else:
                 logger.error("Token refresh failed: %s", msg)
+
         return urn
 
-    def _post(self, payload: dict) -> Optional[str]:
-        """Send the post request to LinkedIn UGC API."""
+    def _post(self, payload: dict) -> Tuple[Optional[str], Optional[int], bool]:
+        """
+        Send the post request to LinkedIn UGC API.
+        Returns (post_urn: Optional[str], status_code: Optional[int], is_timeout: bool).
+        """
         try:
             resp = self.session.post(
                 f"{self.LINKEDIN_API_BASE}/ugcPosts",
@@ -283,18 +324,27 @@ class LinkedInPoster:
             )
             if resp.status_code == 401:
                 logger.error(
-                    "LinkedIn API Error 401: Unauthorized. The access token has expired (60-day limit) or is invalid. "
-                    "Renew at https://developer.linkedin.com."
+                    "LinkedIn API Error 401: Unauthorized. The access token has expired (60-day limit) or is invalid."
                 )
-                return None
+                return (None, 401, False)
             elif resp.status_code == 403:
                 logger.error("LinkedIn API Error 403: Forbidden. Verify application permissions (w_member_social).")
-                return None
+                return (None, 403, False)
+            elif resp.status_code == 429:
+                logger.error("LinkedIn API Error 429: Rate limit exceeded. Backing off.")
+                return (None, 429, False)
+            elif resp.status_code >= 400:
+                logger.error("LinkedIn API Error %s: Request failed.", resp.status_code)
+                return (None, resp.status_code, False)
 
             resp.raise_for_status()
             post_urn = resp.headers.get("X-RestLi-Id")
             logger.info("LinkedIn post successfully published (URN: %s)", post_urn)
-            return post_urn
+            return (post_urn, resp.status_code, False)
+        except requests.Timeout as e:
+            logger.error("LinkedIn UGC posting timed out: %s", e)
+            return (None, None, True)
         except requests.RequestException as e:
-            logger.error("LinkedIn UGC posting failed: %s", e)
-            return None
+            status_code = getattr(e.response, "status_code", None) if hasattr(e, "response") else None
+            logger.error("LinkedIn UGC posting failed (%s): %s", status_code, e)
+            return (None, status_code, False)

@@ -9,8 +9,12 @@ Verifies:
 - Database backup creation and restoration.
 - Database integrity checks.
 - Migration from legacy database.
+- Explicit connection closure to prevent handle leaks.
+- Transaction rollback on unhandled exceptions.
+- Concurrent atomic story claims across threads.
 """
 
+from concurrent.futures import ThreadPoolExecutor
 import os
 import shutil
 import sqlite3
@@ -66,17 +70,24 @@ class TestDatabaseSecurity(unittest.TestCase):
         self.assertEqual(post["status"], "pending")
         self.assertEqual(post["hn_title"], "Tech Story")
 
-        # 2. Claim and mark published
+        # 2. Atomic claim for publishing
+        claimed = self.tracker.claim_for_publishing(post_id)
+        self.assertTrue(claimed)
+
+        # Subsequent claim must fail (prevents concurrent double-publish)
+        claimed_second = self.tracker.claim_for_publishing(post_id)
+        self.assertFalse(claimed_second)
+
+        # 3. Mark published
         urn = "urn:li:share:99999_urn"
-        success_first = self.tracker.claim_and_mark_published(post_id, urn)
+        success_first = self.tracker.mark_published(post_id, urn)
         self.assertTrue(success_first)
 
         # Verified that story is now in posted_stories table
         self.assertTrue(self.tracker.is_posted(99999))
 
-        # 3. Replay attack: attempting to publish the same post again MUST FAIL
-        success_replay = self.tracker.claim_and_mark_published(post_id, "urn:li:share:different")
-        self.assertFalse(success_replay, "Replay attack was not prevented!")
+        # 4. Replay attack: attempting to claim or publish the same post again MUST FAIL
+        self.assertFalse(self.tracker.claim_for_publishing(post_id))
 
     def test_pending_post_skip_lifecycle(self):
         """Skipping a post transitions status and prevents replay."""
@@ -116,7 +127,6 @@ class TestDatabaseSecurity(unittest.TestCase):
 
     def test_legacy_database_migration(self):
         """Migrating from an older database imports stories safely without data loss."""
-        # Create a mock legacy database
         legacy_db = os.path.join(self.temp_dir, "legacy_post_history.db")
         with sqlite3.connect(legacy_db) as conn:
             conn.execute("""
@@ -136,6 +146,51 @@ class TestDatabaseSecurity(unittest.TestCase):
         stats = self.tracker.migrate_from(legacy_db)
         self.assertEqual(stats["imported_posted_stories"], 1)
         self.assertTrue(self.tracker.is_posted(555))
+
+    def test_connection_closure_and_resource_cleanup(self):
+        """Executing database operations must explicitly close connection handles."""
+        # Execute multiple queries
+        for i in range(25):
+            self.tracker.is_posted(i)
+            self.tracker.get_pending_post(f"dummy_{i}")
+
+        # Verify database is not left in a locked state
+        is_valid, msg = self.tracker.check_integrity()
+        self.assertTrue(is_valid, msg)
+
+    def test_transaction_rollback_on_exception(self):
+        """Exceptions raised inside connection context manager must roll back transaction."""
+        hn_id = 991199
+        try:
+            with self.tracker._connection() as conn:
+                conn.execute(
+                    "INSERT INTO posted_stories (hn_id, title) VALUES (?, ?)",
+                    (hn_id, "Temporary Title"),
+                )
+                raise RuntimeError("Simulated failure during transaction")
+        except RuntimeError:
+            pass
+
+        # Record must NOT exist due to rollback
+        self.assertFalse(self.tracker.is_posted(hn_id))
+
+    def test_concurrent_atomic_story_claims(self):
+        """Multiple threads attempting to claim the same story: exactly ONE succeeds."""
+        hn_id = 777777
+
+        def attempt_claim(worker_id):
+            return self.tracker.claim_story_for_publishing(
+                hn_id=hn_id,
+                title=f"Title by worker {worker_id}",
+                url=f"https://example.com/{worker_id}",
+            )
+
+        with ThreadPoolExecutor(max_workers=5) as executor:
+            futures = [executor.submit(attempt_claim, i) for i in range(5)]
+            results = [f.result() for f in futures]
+
+        success_count = sum(1 for success, _ in results if success)
+        self.assertEqual(success_count, 1, f"Expected 1 claim success, got {success_count}: {results}")
 
 
 if __name__ == "__main__":

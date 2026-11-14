@@ -1,18 +1,22 @@
 """
-Tests for LinkedIn Poster Security & Token Lifecycles.
+Tests for LinkedIn Poster Security, Token Lifecycles & Error Handling.
 
 Verifies:
 - Detection of unconfigured credentials.
 - Validation of person URN format.
 - Graceful handling of expired tokens (HTTP 401).
-- Handling of permission denial (HTTP 403).
-- Token refresh mechanism when refresh credentials are provided.
+- HTTP 401 triggers automated refresh when configured.
+- HTTP 400, 403, 429, 5xx do NOT trigger token refresh.
+- Network timeouts raise LinkedInTimeoutError for ambiguous outcome handling.
+- Refresh token rotation persistence.
 """
 
 import unittest
 from unittest.mock import MagicMock, patch
 
-from src.linkedin_poster import LinkedInPoster
+import requests
+
+from src.linkedin_poster import LinkedInPoster, LinkedInTimeoutError
 
 
 class TestLinkedInSecurity(unittest.TestCase):
@@ -59,7 +63,10 @@ class TestLinkedInSecurity(unittest.TestCase):
         """When refresh credentials are configured, token can be refreshed."""
         mock_resp = MagicMock()
         mock_resp.status_code = 200
-        mock_resp.json.return_value = {"access_token": "new_refreshed_token_xyz"}
+        mock_resp.json.return_value = {
+            "access_token": "new_refreshed_token_xyz",
+            "refresh_token": "new_rotated_refresh_token_abc",
+        }
         mock_oauth_post.return_value = mock_resp
 
         poster = LinkedInPoster(access_token="old_token", person_urn="urn:li:person:abcdef")
@@ -71,6 +78,63 @@ class TestLinkedInSecurity(unittest.TestCase):
         success, msg = poster.refresh_access_token()
         self.assertTrue(success)
         self.assertEqual(poster.access_token, "new_refreshed_token_xyz")
+        # Rotated refresh token must be captured and persisted
+        self.assertEqual(poster.refresh_token, "new_rotated_refresh_token_abc")
+
+    @patch("requests.Session.post")
+    @patch.object(LinkedInPoster, "refresh_access_token")
+    def test_refresh_only_on_401_not_on_400_or_403(self, mock_refresh, mock_post):
+        """400 Bad Request and 403 Forbidden must never trigger an OAuth refresh attempt."""
+        poster = LinkedInPoster(access_token="valid_token", person_urn="urn:li:person:abcdef")
+        poster.refresh_token = "valid_refresh_token"
+        poster.client_id = "test_client_id"
+        poster.client_secret = "test_client_secret"
+
+        # 1. Test 400 Bad Request
+        resp_400 = MagicMock()
+        resp_400.status_code = 400
+        mock_post.return_value = resp_400
+        res = poster.create_text_post("Text that triggered 400")
+        self.assertIsNone(res)
+        mock_refresh.assert_not_called()
+
+        # 2. Test 403 Forbidden
+        resp_403 = MagicMock()
+        resp_403.status_code = 403
+        mock_post.return_value = resp_403
+        res = poster.create_text_post("Text that triggered 403")
+        self.assertIsNone(res)
+        mock_refresh.assert_not_called()
+
+    @patch("requests.Session.post")
+    @patch.object(LinkedInPoster, "refresh_access_token")
+    def test_refresh_not_attempted_on_429_or_500(self, mock_refresh, mock_post):
+        """Rate limiting (429) and Server Errors (500) must never trigger token refresh."""
+        poster = LinkedInPoster(access_token="valid_token", person_urn="urn:li:person:abcdef")
+        poster.refresh_token = "valid_refresh_token"
+        poster.client_id = "test_client_id"
+        poster.client_secret = "test_client_secret"
+
+        resp_429 = MagicMock()
+        resp_429.status_code = 429
+        mock_post.return_value = resp_429
+        self.assertIsNone(poster.create_text_post("Rate limited text"))
+        mock_refresh.assert_not_called()
+
+        resp_500 = MagicMock()
+        resp_500.status_code = 500
+        mock_post.return_value = resp_500
+        self.assertIsNone(poster.create_text_post("Server error text"))
+        mock_refresh.assert_not_called()
+
+    @patch("requests.Session.post")
+    def test_network_timeout_raises_linkedin_timeout_error(self, mock_post):
+        """Requests timeout raises LinkedInTimeoutError for ambiguous outcome handling."""
+        mock_post.side_effect = requests.Timeout("Connection timed out")
+
+        poster = LinkedInPoster(access_token="valid_token", person_urn="urn:li:person:abcdef")
+        with self.assertRaises(LinkedInTimeoutError):
+            poster.create_text_post("Test text that times out")
 
 
 if __name__ == "__main__":
