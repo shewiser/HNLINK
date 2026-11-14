@@ -1,0 +1,99 @@
+"""
+Tests for CLI Publishing Safety (scripts/run_pipeline.py).
+
+Verifies:
+- Default invocation runs in dry-run mode without publishing.
+- Non-interactive environments reject direct publishing attempts (fail closed).
+- Interactive mode requires individual approval per post.
+- Skipped or rejected posts are not published.
+"""
+
+import io
+import os
+import sys
+import tempfile
+import unittest
+from unittest.mock import MagicMock, patch
+
+from scripts.run_pipeline import main
+from src.history_tracker import HistoryTracker
+
+
+class TestCliSafety(unittest.TestCase):
+    def setUp(self):
+        self.temp_dir = tempfile.mkdtemp()
+        self.db_path = os.path.join(self.temp_dir, "test_cli.db")
+        os.environ["HN_LINK_DB_PATH"] = self.db_path
+        self.tracker = HistoryTracker(db_path=self.db_path)
+
+    def tearDown(self):
+        os.environ.pop("HN_LINK_DB_PATH", None)
+
+    @patch("scripts.run_pipeline.HNFetcher")
+    @patch("scripts.run_pipeline.ContentExtractor")
+    @patch("scripts.run_pipeline.PostGenerator")
+    @patch("scripts.run_pipeline.LinkedInPoster")
+    def test_default_is_dry_run_no_publishing(
+        self, mock_poster_cls, mock_gen_cls, mock_ext_cls, mock_fetcher_cls
+    ):
+        """Running with no arguments must execute in dry-run mode and never call LinkedInPoster."""
+        mock_fetcher = mock_fetcher_cls.return_value
+        mock_fetcher.get_mixed_stories.return_value = [
+            {"id": 1001, "title": "Story 1", "url": "https://story1.com", "score": 100, "descendants": 20}
+        ]
+        mock_ext = mock_ext_cls.return_value
+        mock_ext.extract.return_value = "Article content paragraph."
+
+        mock_gen = mock_gen_cls.return_value
+        mock_gen.generate.return_value = "Generated LinkedIn post."
+
+        out_json = os.path.join(self.temp_dir, "test_output.json")
+        test_args = ["run_pipeline.py", "--count", "1", "--output", out_json]
+
+        with patch.object(sys, "argv", test_args):
+            main()
+
+        # LinkedInPoster._post must NOT be called in dry-run mode
+        mock_poster_cls.return_value.create_article_post.assert_not_called()
+        self.assertTrue(os.path.exists(out_json))
+
+    @patch("scripts.run_pipeline.sys.stdin.isatty", return_value=False)
+    def test_non_interactive_publishing_fails_closed(self, mock_isatty):
+        """Attempting to publish without an interactive TTY must exit with error."""
+        test_args = ["run_pipeline.py", "--publish"]
+        with patch.object(sys, "argv", test_args):
+            with self.assertRaises(SystemExit) as cm:
+                main()
+            self.assertEqual(cm.exception.code, 1)
+
+    @patch("scripts.run_pipeline.sys.stdin.isatty", return_value=True)
+    @patch("builtins.input", side_effect=["n"])  # User skips post
+    @patch("scripts.run_pipeline.HNFetcher")
+    @patch("scripts.run_pipeline.ContentExtractor")
+    @patch("scripts.run_pipeline.PostGenerator")
+    @patch("scripts.run_pipeline.LinkedInPoster")
+    def test_interactive_individual_skip_prevents_publishing(
+        self, mock_poster_cls, mock_gen_cls, mock_ext_cls, mock_fetcher_cls, mock_input, mock_isatty
+    ):
+        """When user responds 'n', post is skipped and not sent to LinkedIn."""
+        mock_fetcher = mock_fetcher_cls.return_value
+        mock_fetcher.get_mixed_stories.return_value = [
+            {"id": 2002, "title": "Story 2", "url": "https://story2.com", "score": 200, "descendants": 50}
+        ]
+        mock_ext = mock_ext_cls.return_value
+        mock_ext.extract.return_value = "Article text."
+        mock_gen = mock_gen_cls.return_value
+        mock_gen.generate.return_value = "LinkedIn Draft."
+
+        test_args = ["run_pipeline.py", "--publish"]
+        with patch.object(sys, "argv", test_args):
+            main()
+
+        # LinkedIn poster must NOT have been called
+        mock_poster_cls.return_value.create_article_post.assert_not_called()
+        # Story must NOT be in posted_stories
+        self.assertFalse(self.tracker.is_posted(2002))
+
+
+if __name__ == "__main__":
+    unittest.main()

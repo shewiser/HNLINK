@@ -28,10 +28,13 @@ class PostGenerator:
         "qwen/qwen3-235b-a22b:free",
     ]
 
-    def __init__(self):
+    def __init__(self, api_key: Optional[str] = None):
+        key = api_key or settings.openrouter_api_key
+        if not key:
+            raise ValueError("OPENROUTER_API_KEY environment variable is required for PostGenerator")
         self.client = OpenAI(
             base_url=settings.openrouter_base_url,
-            api_key=settings.openrouter_api_key,
+            api_key=key,
             timeout=60.0,
             max_retries=2,
         )

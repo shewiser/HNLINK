@@ -1,38 +1,87 @@
 """
-Flask API server that bridges n8n and the Python pipeline.
+Security-hardened Flask API server that bridges n8n and the Python pipeline.
 
 Endpoints:
-  GET  /health                      - Health check
-  POST /pipeline/fetch-and-generate - Run full pipeline, return generated posts
-  POST /pipeline/post-to-linkedin   - Post approved content to LinkedIn
+  GET  /health                      - Public health check
+  POST /pipeline/fetch-and-generate - Run full pipeline, return generated posts (Authenticated)
+  POST /pipeline/post-to-linkedin   - Post approved content to LinkedIn (Authenticated)
 """
 
-import sys
+import functools
+import hmac
 import os
+import sys
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from dotenv import load_dotenv
 load_dotenv(os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), ".env"))
 
-from flask import Flask, request, jsonify
+from flask import Flask, jsonify, request
 
 from config.settings import settings
-from src.hn_fetcher import HNFetcher
 from src.content_extractor import ContentExtractor
-from src.post_generator import PostGenerator
-from src.linkedin_poster import LinkedInPoster
 from src.history_tracker import HistoryTracker
+from src.hn_fetcher import HNFetcher
+from src.linkedin_poster import LinkedInPoster
+from src.post_generator import PostGenerator
 
 app = Flask(__name__)
 
 
+def require_api_auth(f):
+    """
+    Decorator that enforces token authentication.
+    - Rejects tokens passed in query parameters (fail closed).
+    - Requires Authorization: Bearer <token>, X-API-Key: <token>, or X-Webhook-Token: <token>.
+    - Validates token using constant-time comparison (hmac.compare_digest).
+    """
+    @functools.wraps(f)
+    def decorated(*args, **kwargs):
+        # 1. Strictly forbid credentials in query parameters to prevent leakages in URLs/logs
+        sensitive_params = {"token", "api_key", "webhook_token", "key", "auth", "secret"}
+        if any(param in request.args for param in sensitive_params):
+            return jsonify({
+                "error": "Bad Request: Authentication tokens must not be passed in URL query parameters. Use the Authorization header or X-API-Key."
+            }), 400
+
+        # 2. Check that the server has an authentication secret configured (fail-closed)
+        expected_token = (settings.api_auth_token or settings.n8n_webhook_token or "").strip()
+        if not expected_token:
+            return jsonify({
+                "error": "Server Configuration Error: API authentication token is unconfigured (fail-closed). Set HN_LINK_API_KEY or N8N_WEBHOOK_TOKEN in .env."
+            }), 503
+
+        # 3. Extract token from supported headers
+        auth_header = request.headers.get("Authorization", "").strip()
+        provided_token = ""
+        if auth_header.startswith("Bearer "):
+            provided_token = auth_header[7:].strip()
+        elif not auth_header:
+            provided_token = (
+                request.headers.get("X-API-Key", "").strip()
+                or request.headers.get("X-Webhook-Token", "").strip()
+            )
+
+        if not provided_token:
+            return jsonify({"error": "Unauthorized: Missing authentication token"}), 401
+
+        # 4. Constant-time comparison to prevent timing attacks
+        if not hmac.compare_digest(provided_token.encode("utf-8"), expected_token.encode("utf-8")):
+            return jsonify({"error": "Unauthorized: Invalid authentication token"}), 401
+
+        return f(*args, **kwargs)
+    return decorated
+
+
 @app.get("/health")
 def health():
+    """Public health check endpoint."""
     return jsonify({"status": "ok"})
 
 
 @app.post("/pipeline/fetch-and-generate")
+@require_api_auth
 def fetch_and_generate():
     """Run the full pipeline: fetch HN -> extract -> generate posts."""
     data = request.get_json(silent=True) or {}
@@ -98,9 +147,10 @@ def fetch_and_generate():
 
 
 @app.post("/pipeline/post-to-linkedin")
+@require_api_auth
 def post_to_linkedin():
     """Post approved content to LinkedIn."""
-    data = request.get_json()
+    data = request.get_json(silent=True)
     if not data or "text" not in data:
         return jsonify({"error": "Missing 'text' field"}), 400
 
@@ -127,7 +177,7 @@ def post_to_linkedin():
 
 if __name__ == "__main__":
     app.run(
-        host="0.0.0.0",
-        port=5000,
-        debug=True,
+        host=settings.flask_host,
+        port=settings.flask_port,
+        debug=settings.flask_debug,
     )

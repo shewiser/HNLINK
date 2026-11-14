@@ -233,50 +233,57 @@ TELEGRAM_CHAT_ID=xxxxxxxx
 
 ## Environment Variables
 
-| Variable              | Required | Description           |
-| --------------------- | -------- | --------------------- |
-| OPENROUTER_API_KEY    | ✅        | OpenRouter API key    |
-| LINKEDIN_ACCESS_TOKEN | ✅        | LinkedIn OAuth token  |
-| LINKEDIN_PERSON_URN   | ✅        | LinkedIn profile URN  |
-| TELEGRAM_BOT_TOKEN    | ✅        | Telegram Bot token    |
-| TELEGRAM_CHAT_ID      | ✅        | Chat ID for approvals |
+| Variable | Required | Default | Description |
+| -------- | -------- | ------- | ----------- |
+| `OPENROUTER_API_KEY` | ✅ | *None* | OpenRouter API key for AI post generation |
+| `LINKEDIN_ACCESS_TOKEN` | ✅ (for posting) | `""` | LinkedIn OAuth token (60-day lifespan) |
+| `LINKEDIN_PERSON_URN` | ✅ (for posting) | `""` | LinkedIn member profile URN (`urn:li:person:<id>`) |
+| `TELEGRAM_BOT_TOKEN` | ✅ (Telegram mode) | `""` | Telegram Bot token from @BotFather |
+| `TELEGRAM_ALLOWED_USERS` | ✅ (Telegram mode) | `""` | Authorized user ID allowlist (fail-closed if unset) |
+| `TELEGRAM_ALLOWED_CHATS` | Optional | `""` | Authorized chat ID allowlist |
+| `HN_LINK_API_KEY` | ✅ (API mode) | `""` | Authentication token for Flask REST endpoints |
+| `FLASK_HOST` | Optional | `127.0.0.1` | IP interface to bind Flask API server |
+| `FLASK_PORT` | Optional | `5000` | Port for Flask API server |
+| `FLASK_DEBUG` | Optional | `false` | Enable Flask debug mode (keep false in production) |
+| `HN_LINK_DB_PATH` | Optional | `post_history.db` | Path to SQLite database file |
 
 ---
 
 ## Run
 
+### 1. Interactive Telegram Bot
 ```bash
 python src/telegram_bot.py
 ```
+*Note: Make sure your Telegram user ID is listed in `TELEGRAM_ALLOWED_USERS` in `.env` (obtain your ID via @userinfobot).*
 
-Open Telegram.
+### 2. Standalone CLI Pipeline
+```bash
+# Safe preview mode (DEFAULT - does NOT post to LinkedIn):
+python -m scripts.run_pipeline --count 3
 
+# Interactive review and publishing (requires [y/N] confirmation for each post):
+python -m scripts.run_pipeline --publish
 ```
-/fetch
+
+### 3. Flask API Server
+```bash
+python api/app.py
 ```
-
-Within a few seconds you'll receive generated posts with:
-
-✅ Approve
-
-❌ Skip
-
-Approve publishes immediately.
-
-Skip permanently ignores the story.
+*Endpoints require `Authorization: Bearer <token>` or `X-API-Key: <token>`.*
 
 ---
 
 # 📱 Telegram Commands
 
-| Command    | Description                |
-| ---------- | -------------------------- |
-| `/start`   | Display available commands |
-| `/fetch`   | Generate 3 LinkedIn posts  |
-| `/fetch 5` | Generate 5 posts           |
-| `/status`  | Check APIs and bot health  |
-| `/history` | View posting statistics    |
-| `/help`    | Show command reference     |
+| Command | Description |
+| ------- | ----------- |
+| `/start` | Display bot commands and welcome banner |
+| `/fetch` | Generate 3 LinkedIn posts and persist for review |
+| `/fetch N` | Generate N posts (max 10) |
+| `/pending` | List unapproved drafts stored in SQLite database |
+| `/status` | Check API credentials, pending post count, and bot health |
+| `/history` | View total published story statistics |
 
 ---
 
