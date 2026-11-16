@@ -63,6 +63,32 @@ class TestCliSafety(unittest.TestCase):
         mock_poster_cls.return_value.create_article_post.assert_not_called()
         self.assertTrue(os.path.exists(out_json))
 
+    @patch("scripts.run_pipeline.HNFetcher")
+    @patch("scripts.run_pipeline.ContentExtractor")
+    @patch("scripts.run_pipeline.PostGenerator")
+    @patch("scripts.run_pipeline.LinkedInPoster")
+    def test_explicit_dry_run_alone_no_publishing(
+        self, mock_poster_cls, mock_gen_cls, mock_ext_cls, mock_fetcher_cls
+    ):
+        """Passing --dry-run explicitly executes in preview mode without publishing."""
+        mock_fetcher = mock_fetcher_cls.return_value
+        mock_fetcher.get_mixed_stories.return_value = [
+            {"id": 1002, "title": "Dry Run Story", "url": "https://story2.com", "score": 150, "descendants": 30}
+        ]
+        mock_ext = mock_ext_cls.return_value
+        mock_ext.extract.return_value = "Article content."
+        mock_gen = mock_gen_cls.return_value
+        mock_gen.generate.return_value = "Draft text."
+
+        out_json = os.path.join(self.temp_dir, "test_dry_run_output.json")
+        test_args = ["run_pipeline.py", "--dry-run", "--output", out_json]
+
+        with patch.object(sys, "argv", test_args):
+            main()
+
+        mock_poster_cls.return_value.create_article_post.assert_not_called()
+        self.assertTrue(os.path.exists(out_json))
+
     @patch("scripts.run_pipeline.sys.stdin.isatty", return_value=False)
     def test_non_interactive_publishing_fails_closed(self, mock_isatty):
         """Attempting to publish without an interactive TTY must exit with error."""

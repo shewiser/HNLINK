@@ -233,6 +233,38 @@ class TestApiSecurity(unittest.TestCase):
             resp2 = self.client.post("/pipeline/post-to-linkedin", json=payload, headers=headers)
             self.assertEqual(resp2.status_code, 409)
 
+    def test_concurrent_flask_requests_atomically_deduplicated(self):
+        """Simultaneous concurrent requests for the same HN story must permit exactly one publication."""
+        headers = {"Authorization": f"Bearer {self.test_token}"}
+        payload = {
+            "text": "Concurrent webhook post",
+            "hn_id": 777123,
+            "article_url": "https://example.com/story777123",
+        }
+
+        with patch("api.app.LinkedInPoster") as mock_poster:
+            instance = mock_poster.return_value
+            def fake_post(text, url="", title=""):
+                import time
+                time.sleep(0.05)
+                return "urn:li:share:concurrent_api_success"
+            instance.create_article_post.side_effect = fake_post
+
+            def make_request(worker_id):
+                with app.test_client() as client:
+                    return client.post("/pipeline/post-to-linkedin", json=payload, headers=headers)
+
+            with ThreadPoolExecutor(max_workers=2) as executor:
+                f1 = executor.submit(make_request, 1)
+                f2 = executor.submit(make_request, 2)
+                r1 = f1.result()
+                r2 = f2.result()
+
+            status_codes = [r1.status_code, r2.status_code]
+            self.assertIn(200, status_codes, f"One request must succeed, got {status_codes}")
+            self.assertIn(409, status_codes, f"The competing request must return 409 Conflict, got {status_codes}")
+            self.assertEqual(instance.create_article_post.call_count, 1)
+
     def test_safe_server_defaults(self):
         """Flask server default host must be 127.0.0.1 and debug must be False."""
         self.assertEqual(settings.flask_host, "127.0.0.1")

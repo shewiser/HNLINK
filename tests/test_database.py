@@ -166,6 +166,18 @@ class TestDatabaseSecurity(unittest.TestCase):
         is_valid, msg = self.tracker.check_integrity()
         self.assertTrue(is_valid, msg)
 
+    def test_connection_closure_on_exception(self):
+        """Connection must be closed even when an exception is raised inside the context manager."""
+        try:
+            with self.tracker._connection() as conn:
+                conn.execute("SELECT 1")
+                raise ValueError("Deliberate error to verify connection closure in finally")
+        except ValueError:
+            pass
+
+        is_valid, msg = self.tracker.check_integrity()
+        self.assertTrue(is_valid, msg)
+
     def test_transaction_rollback_on_exception(self):
         """Exceptions raised inside connection context manager must roll back transaction."""
         hn_id = 991199
