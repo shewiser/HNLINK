@@ -8,5 +8,6 @@ dist/
 build/
 pending_posts.json
 post_history.db
+.credentials_store*
 .claude/
 scripts/linkedin_oauth.py

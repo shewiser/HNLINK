@@ -1,12 +1,13 @@
 """
-SQLite-based history tracker and persistent pending-approval store.
+SQLite-based history tracker, persistent pending-approval store, and atomic idempotency engine.
 
 Features:
 - Configurable database path via HN_LINK_DB_PATH
 - Preserves legacy database location (../post_history.db) if present
 - Tracks posted stories to prevent duplicate publications
+- Persistent idempotency claims table ensuring no publishing path bypasses deduplication
 - Atomic state transitions (pending -> publishing -> published / skipped / failed / reconciliation_needed)
-- Atomic webhook deduplication and claim mechanisms for API endpoints
+- Input bounds and string sanitization on story titles, URLs, texts, and error messages
 - Connection lifecycle management with explicit closure to prevent resource leaks
 - SQLite WAL mode and integrity verification
 - Non-destructive backup and migration utilities
@@ -20,6 +21,20 @@ from datetime import datetime, timezone
 from typing import Any, Dict, Iterator, List, Optional, Set, Tuple
 
 logger = logging.getLogger(__name__)
+
+# Input bounds (Fix L-1)
+MAX_TITLE_CHARS = 500
+MAX_URL_CHARS = 2048
+MAX_POST_TEXT_CHARS = 25000
+MAX_ERROR_CHARS = 2000
+MAX_KEY_CHARS = 255
+
+
+def _sanitize_str(val: Any, max_len: int) -> str:
+    """Helper to convert to string and truncate within safe bounds."""
+    if val is None:
+        return ""
+    return str(val)[:max_len]
 
 
 def resolve_default_db_path() -> str:
@@ -113,6 +128,23 @@ class HistoryTracker:
             """)
             conn.execute("CREATE INDEX IF NOT EXISTS idx_pending_posts_status ON pending_posts(status);")
 
+            # 3. Persistent idempotency claims table (Fix M-1)
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS idempotency_claims (
+                    idempotency_key TEXT PRIMARY KEY,
+                    hn_id INTEGER,
+                    title TEXT,
+                    url TEXT,
+                    linkedin_post_urn TEXT,
+                    status TEXT DEFAULT 'publishing',
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    error_message TEXT
+                );
+            """)
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_claims_hn_id ON idempotency_claims(hn_id);")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_claims_status ON idempotency_claims(status);")
+
     # =========================================================================
     # POSTED STORIES / DEDUPLICATION & WEBHOOK CLAIMS
     # =========================================================================
@@ -134,12 +166,11 @@ class HistoryTracker:
         """
         Atomically claim a story for publishing to prevent concurrent or duplicate webhook publishing.
         Returns (success: bool, status_reason: str).
-        - If claimed: returns (True, "claimed")
-        - If already published: returns (False, "already_published")
-        - If in-flight: returns (False, "currently_publishing")
-        - If uncertain: returns (False, "reconciliation_needed")
         """
+        clean_title = _sanitize_str(title, MAX_TITLE_CHARS)
+        clean_url = _sanitize_str(url, MAX_URL_CHARS)
         now = datetime.now(timezone.utc).isoformat()
+
         with self._connection() as conn:
             row = conn.execute(
                 "SELECT status FROM posted_stories WHERE hn_id = ?", (hn_id,)
@@ -161,7 +192,7 @@ class HistoryTracker:
                         SET status = 'publishing', title = ?, url = ?, posted_at = ?, error_message = NULL
                         WHERE hn_id = ? AND status = 'failed'
                         """,
-                        (title, url, now, hn_id),
+                        (clean_title, clean_url, now, hn_id),
                     )
                     return (cursor.rowcount > 0, "claimed" if cursor.rowcount > 0 else "conflict")
 
@@ -172,7 +203,7 @@ class HistoryTracker:
                     INSERT INTO posted_stories (hn_id, title, url, linkedin_post_urn, posted_at, status)
                     VALUES (?, ?, ?, '', ?, 'publishing')
                     """,
-                    (hn_id, title, url, now),
+                    (hn_id, clean_title, clean_url, now),
                 )
                 return (True, "claimed")
             except sqlite3.IntegrityError:
@@ -181,6 +212,8 @@ class HistoryTracker:
 
     def mark_story_published(self, hn_id: int, title: str, url: str, linkedin_post_urn: str):
         """Finalize publication state of a story to 'published'."""
+        clean_title = _sanitize_str(title, MAX_TITLE_CHARS)
+        clean_url = _sanitize_str(url, MAX_URL_CHARS)
         now = datetime.now(timezone.utc).isoformat()
         with self._connection() as conn:
             conn.execute(
@@ -195,11 +228,12 @@ class HistoryTracker:
                     status = 'published',
                     error_message = NULL
                 """,
-                (hn_id, title, url, linkedin_post_urn, now),
+                (hn_id, clean_title, clean_url, linkedin_post_urn, now),
             )
 
     def mark_story_uncertain(self, hn_id: int, error_message: str):
         """Mark a story as requiring reconciliation (e.g. after network timeout during publishing)."""
+        clean_error = _sanitize_str(error_message, MAX_ERROR_CHARS)
         now = datetime.now(timezone.utc).isoformat()
         with self._connection() as conn:
             conn.execute(
@@ -210,11 +244,12 @@ class HistoryTracker:
                     posted_at = ?
                 WHERE hn_id = ?
                 """,
-                (error_message, now, hn_id),
+                (clean_error, now, hn_id),
             )
 
     def mark_story_failed(self, hn_id: int, error_message: str):
         """Mark publication attempt as failed."""
+        clean_error = _sanitize_str(error_message, MAX_ERROR_CHARS)
         now = datetime.now(timezone.utc).isoformat()
         with self._connection() as conn:
             conn.execute(
@@ -225,7 +260,7 @@ class HistoryTracker:
                     posted_at = ?
                 WHERE hn_id = ?
                 """,
-                (error_message, now, hn_id),
+                (clean_error, now, hn_id),
             )
 
     def mark_posted(self, hn_id: int, title: str, url: str, linkedin_post_urn: str = ""):
@@ -239,6 +274,166 @@ class HistoryTracker:
                 "SELECT hn_id FROM posted_stories WHERE status IN ('published', 'publishing', 'reconciliation_needed')"
             ).fetchall()
             return {row["hn_id"] for row in rows}
+
+    # =========================================================================
+    # IDEMPOTENCY CLAIMS (Fix M-1)
+    # =========================================================================
+
+    def claim_idempotency_key(
+        self,
+        idempotency_key: str,
+        hn_id: Optional[int] = None,
+        title: str = "",
+        url: str = "",
+    ) -> Tuple[bool, str]:
+        """
+        Atomically claim an idempotency key before external publishing.
+        Enforces unique constraint across both HN and generic publications.
+        Returns (success: bool, status_reason: str).
+        """
+        clean_key = _sanitize_str(idempotency_key, MAX_KEY_CHARS).strip()
+        if not clean_key:
+            return (False, "invalid_key")
+
+        clean_title = _sanitize_str(title, MAX_TITLE_CHARS)
+        clean_url = _sanitize_str(url, MAX_URL_CHARS)
+        now = datetime.now(timezone.utc).isoformat()
+
+        # If hn_id is provided, check posted_stories first
+        if hn_id and hn_id > 0:
+            claimed_hn, hn_reason = self.claim_story_for_publishing(hn_id, clean_title, clean_url)
+            if not claimed_hn:
+                return (False, hn_reason)
+
+        with self._connection() as conn:
+            row = conn.execute(
+                "SELECT status FROM idempotency_claims WHERE idempotency_key = ?",
+                (clean_key,),
+            ).fetchone()
+
+            if row:
+                current_status = row["status"]
+                if current_status in ("published", "publishing", "reconciliation_needed"):
+                    return (False, current_status)
+                elif current_status == "failed":
+                    cursor = conn.execute(
+                        """
+                        UPDATE idempotency_claims
+                        SET status = 'publishing', hn_id = ?, title = ?, url = ?, updated_at = ?, error_message = NULL
+                        WHERE idempotency_key = ? AND status = 'failed'
+                        """,
+                        (hn_id, clean_title, clean_url, now, clean_key),
+                    )
+                    return (cursor.rowcount > 0, "claimed" if cursor.rowcount > 0 else "conflict")
+
+            try:
+                conn.execute(
+                    """
+                    INSERT INTO idempotency_claims (
+                        idempotency_key, hn_id, title, url, linkedin_post_urn,
+                        status, created_at, updated_at
+                    ) VALUES (?, ?, ?, ?, '', 'publishing', ?, ?)
+                    """,
+                    (clean_key, hn_id, clean_title, clean_url, now, now),
+                )
+                return (True, "claimed")
+            except sqlite3.IntegrityError:
+                return (False, "conflict")
+
+    def mark_claim_published(
+        self,
+        idempotency_key: str,
+        linkedin_post_urn: str,
+        hn_id: Optional[int] = None,
+        title: str = "",
+        url: str = "",
+    ) -> bool:
+        """Mark an idempotency claim as successfully published."""
+        clean_key = _sanitize_str(idempotency_key, MAX_KEY_CHARS).strip()
+        clean_title = _sanitize_str(title, MAX_TITLE_CHARS)
+        clean_url = _sanitize_str(url, MAX_URL_CHARS)
+        now = datetime.now(timezone.utc).isoformat()
+
+        if hn_id and hn_id > 0:
+            self.mark_story_published(hn_id, clean_title, clean_url, linkedin_post_urn)
+
+        with self._connection() as conn:
+            cursor = conn.execute(
+                """
+                UPDATE idempotency_claims
+                SET status = 'published',
+                    linkedin_post_urn = ?,
+                    updated_at = ?,
+                    error_message = NULL
+                WHERE idempotency_key = ?
+                """,
+                (linkedin_post_urn, now, clean_key),
+            )
+            return cursor.rowcount > 0
+
+    def mark_claim_uncertain(
+        self,
+        idempotency_key: str,
+        error_message: str,
+        hn_id: Optional[int] = None,
+    ) -> bool:
+        """Mark an idempotency claim as reconciliation_needed (e.g. after network timeout)."""
+        clean_key = _sanitize_str(idempotency_key, MAX_KEY_CHARS).strip()
+        clean_error = _sanitize_str(error_message, MAX_ERROR_CHARS)
+        now = datetime.now(timezone.utc).isoformat()
+
+        if hn_id and hn_id > 0:
+            self.mark_story_uncertain(hn_id, clean_error)
+
+        with self._connection() as conn:
+            cursor = conn.execute(
+                """
+                UPDATE idempotency_claims
+                SET status = 'reconciliation_needed',
+                    error_message = ?,
+                    updated_at = ?
+                WHERE idempotency_key = ?
+                """,
+                (clean_error, now, clean_key),
+            )
+            return cursor.rowcount > 0
+
+    def mark_claim_failed(
+        self,
+        idempotency_key: str,
+        error_message: str,
+        hn_id: Optional[int] = None,
+    ) -> bool:
+        """Mark an idempotency claim as failed."""
+        clean_key = _sanitize_str(idempotency_key, MAX_KEY_CHARS).strip()
+        clean_error = _sanitize_str(error_message, MAX_ERROR_CHARS)
+        now = datetime.now(timezone.utc).isoformat()
+
+        if hn_id and hn_id > 0:
+            self.mark_story_failed(hn_id, clean_error)
+
+        with self._connection() as conn:
+            cursor = conn.execute(
+                """
+                UPDATE idempotency_claims
+                SET status = 'failed',
+                    error_message = ?,
+                    updated_at = ?
+                WHERE idempotency_key = ?
+                """,
+                (clean_error, now, clean_key),
+            )
+            return cursor.rowcount > 0
+
+    def get_claim(self, idempotency_key: str) -> Optional[Dict[str, Any]]:
+        """Retrieve an idempotency claim record by key."""
+        clean_key = _sanitize_str(idempotency_key, MAX_KEY_CHARS).strip()
+        with self._connection() as conn:
+            row = conn.execute(
+                "SELECT * FROM idempotency_claims WHERE idempotency_key = ?",
+                (clean_key,),
+            ).fetchone()
+            return dict(row) if row else None
 
     # =========================================================================
     # PERSISTENT PENDING APPROVALS
@@ -257,7 +452,12 @@ class HistoryTracker:
         image_data: Optional[bytes] = None,
     ) -> bool:
         """Save a newly generated post draft awaiting approval."""
+        clean_title = _sanitize_str(title, MAX_TITLE_CHARS)
+        clean_url = _sanitize_str(url, MAX_URL_CHARS)
+        clean_text = _sanitize_str(linkedin_text, MAX_POST_TEXT_CHARS)
+        clean_image_url = _sanitize_str(image_url, MAX_URL_CHARS) if image_url else None
         now = datetime.now(timezone.utc).isoformat()
+
         with self._connection() as conn:
             conn.execute(
                 """
@@ -267,8 +467,8 @@ class HistoryTracker:
                 ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?)
                 """,
                 (
-                    post_id, hn_id, title, url, score, comments,
-                    linkedin_text, image_url, image_data, now, now
+                    post_id, hn_id, clean_title, clean_url, score, comments,
+                    clean_text, clean_image_url, image_data, now, now
                 ),
             )
             return True
@@ -336,6 +536,8 @@ class HistoryTracker:
             ).fetchone()
 
             if post and post["hn_id"]:
+                clean_title = _sanitize_str(post["hn_title"], MAX_TITLE_CHARS)
+                clean_url = _sanitize_str(post["hn_url"], MAX_URL_CHARS)
                 conn.execute(
                     """
                     INSERT INTO posted_stories (hn_id, title, url, linkedin_post_urn, posted_at, status)
@@ -347,7 +549,7 @@ class HistoryTracker:
                         posted_at = excluded.posted_at,
                         status = 'published'
                     """,
-                    (post["hn_id"], post["hn_title"], post["hn_url"], linkedin_post_urn, now),
+                    (post["hn_id"], clean_title, clean_url, linkedin_post_urn, now),
                 )
             return True
 
@@ -378,6 +580,7 @@ class HistoryTracker:
         Transition: publishing -> failed.
         Records error message and releases lock so it can be retried or inspected.
         """
+        clean_error = _sanitize_str(error_message, MAX_ERROR_CHARS)
         now = datetime.now(timezone.utc).isoformat()
         with self._connection() as conn:
             cursor = conn.execute(
@@ -388,7 +591,7 @@ class HistoryTracker:
                     updated_at = ?
                 WHERE post_id = ?
                 """,
-                (error_message, now, post_id),
+                (clean_error, now, post_id),
             )
             return cursor.rowcount > 0
 
@@ -402,6 +605,7 @@ class HistoryTracker:
         Used when an external call times out or drops connection ambiguously.
         Prevents automated replay without manual verification.
         """
+        clean_error = _sanitize_str(error_message, MAX_ERROR_CHARS)
         now = datetime.now(timezone.utc).isoformat()
         with self._connection() as conn:
             cursor = conn.execute(
@@ -412,7 +616,7 @@ class HistoryTracker:
                     updated_at = ?
                 WHERE post_id = ? AND status = 'publishing'
                 """,
-                (error_message, now, post_id),
+                (clean_error, now, post_id),
             )
             return cursor.rowcount > 0
 
@@ -479,8 +683,8 @@ class HistoryTracker:
                             """,
                             (
                                 row["hn_id"],
-                                row["title"],
-                                row["url"],
+                                _sanitize_str(row["title"], MAX_TITLE_CHARS),
+                                _sanitize_str(row["url"], MAX_URL_CHARS),
                                 row["linkedin_post_urn"],
                                 row["posted_at"],
                                 row["status"] if "status" in row.keys() else "published",
@@ -504,11 +708,14 @@ class HistoryTracker:
                             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                             """,
                             (
-                                row["post_id"], row["hn_id"], row["hn_title"], row["hn_url"],
-                                row["hn_score"], row["hn_comments"], row["linkedin_text"],
+                                row["post_id"], row["hn_id"],
+                                _sanitize_str(row["hn_title"], MAX_TITLE_CHARS),
+                                _sanitize_str(row["hn_url"], MAX_URL_CHARS),
+                                row["hn_score"], row["hn_comments"],
+                                _sanitize_str(row["linkedin_text"], MAX_POST_TEXT_CHARS),
                                 row["image_url"], row["image_data"], row["status"],
                                 row["created_at"], row["updated_at"], row["linkedin_post_urn"],
-                                row["error_message"]
+                                _sanitize_str(row["error_message"], MAX_ERROR_CHARS)
                             ),
                         )
                         imported_pending += 1

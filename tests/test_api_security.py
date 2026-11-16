@@ -7,8 +7,11 @@ Verifies:
 - Invalid or missing tokens return 401 Unauthorized.
 - Tokens in query parameters return 400 Bad Request.
 - Constant-time comparison works for Bearer token and X-API-Key.
-- Duplicate webhook requests for the same HN story return 409 Conflict.
+- Missing or non-positive hn_id without idempotency_key returns 400 Bad Request.
+- Generic non-HN publishing with explicit idempotency_key succeeds.
+- Duplicate webhook requests for the same HN story or idempotency key return 409 Conflict.
 - Network timeouts return 504 and record reconciliation_needed status.
+- Concurrent requests for the same story/key atomically permit exactly ONE publication.
 - Default host and debug settings adhere to security standards.
 """
 
@@ -60,19 +63,19 @@ class TestApiSecurity(unittest.TestCase):
         self.assertEqual(resp.status_code, 401)
         self.assertIn("Missing authentication token", resp.get_json().get("error", ""))
 
-        resp_publish = self.client.post("/pipeline/post-to-linkedin", json={"text": "Hello"})
+        resp_publish = self.client.post("/pipeline/post-to-linkedin", json={"text": "Hello", "hn_id": 1})
         self.assertEqual(resp_publish.status_code, 401)
 
     def test_invalid_auth_token_rejected(self):
         """Requests with an invalid Bearer token must return 401."""
         headers = {"Authorization": "Bearer wrong-token"}
-        resp = self.client.post("/pipeline/post-to-linkedin", json={"text": "Test"}, headers=headers)
+        resp = self.client.post("/pipeline/post-to-linkedin", json={"text": "Test", "hn_id": 1}, headers=headers)
         self.assertEqual(resp.status_code, 401)
         self.assertIn("Invalid authentication token", resp.get_json().get("error", ""))
 
     def test_query_parameter_token_rejected(self):
         """Tokens passed via URL query parameters must be rejected with 400."""
-        resp = self.client.post("/pipeline/post-to-linkedin?token=secret-test-token-12345", json={"text": "Test"})
+        resp = self.client.post("/pipeline/post-to-linkedin?token=secret-test-token-12345", json={"text": "Test", "hn_id": 1})
         self.assertEqual(resp.status_code, 400)
         self.assertIn("query parameters", resp.get_json().get("error", ""))
 
@@ -110,9 +113,79 @@ class TestApiSecurity(unittest.TestCase):
         settings.api_auth_token = ""
         settings.n8n_webhook_token = ""
         headers = {"Authorization": "Bearer any-token"}
-        resp = self.client.post("/pipeline/post-to-linkedin", json={"text": "Test"}, headers=headers)
+        resp = self.client.post("/pipeline/post-to-linkedin", json={"text": "Test", "hn_id": 1}, headers=headers)
         self.assertEqual(resp.status_code, 503)
         self.assertIn("fail-closed", resp.get_json().get("error", ""))
+
+    def test_missing_hn_id_and_idempotency_key_rejected_400(self):
+        """Publishing without hn_id AND without idempotency_key must return 400 Bad Request."""
+        headers = {"Authorization": f"Bearer {self.test_token}"}
+        resp = self.client.post(
+            "/pipeline/post-to-linkedin",
+            json={"text": "Publish without identifier"},
+            headers=headers,
+        )
+        self.assertEqual(resp.status_code, 400)
+        self.assertIn("Missing publication identifier", resp.get_json().get("error", ""))
+
+    def test_invalid_hn_id_rejected_400(self):
+        """Non-positive or non-numeric hn_id must be rejected with 400 Bad Request."""
+        headers = {"Authorization": f"Bearer {self.test_token}"}
+
+        # 1. Zero hn_id
+        resp_zero = self.client.post("/pipeline/post-to-linkedin", json={"text": "Text", "hn_id": 0}, headers=headers)
+        self.assertEqual(resp_zero.status_code, 400)
+        self.assertIn("positive integer", resp_zero.get_json().get("error", ""))
+
+        # 2. Negative hn_id
+        resp_neg = self.client.post("/pipeline/post-to-linkedin", json={"text": "Text", "hn_id": -99}, headers=headers)
+        self.assertEqual(resp_neg.status_code, 400)
+
+        # 3. Non-numeric hn_id
+        resp_str = self.client.post("/pipeline/post-to-linkedin", json={"text": "Text", "hn_id": "not_an_int"}, headers=headers)
+        self.assertEqual(resp_str.status_code, 400)
+
+    def test_generic_publishing_with_idempotency_key_accepted(self):
+        """Non-HN publications with an explicit idempotency_key succeed and deduplicate."""
+        headers = {"Authorization": f"Bearer {self.test_token}"}
+        payload = {
+            "text": "Generic article post without HN ID",
+            "idempotency_key": "custom-article-uuid-12345",
+            "article_url": "https://example.com/custom",
+        }
+
+        with patch("api.app.LinkedInPoster") as mock_poster:
+            instance = mock_poster.return_value
+            instance.create_article_post.return_value = "urn:li:share:custom_post_1"
+
+            # 1. First attempt succeeds
+            resp1 = self.client.post("/pipeline/post-to-linkedin", json=payload, headers=headers)
+            self.assertEqual(resp1.status_code, 200)
+            self.assertEqual(resp1.get_json().get("status"), "posted")
+            self.assertEqual(resp1.get_json().get("idempotency_key"), "custom-article-uuid-12345")
+
+            # 2. Duplicate attempt with same idempotency_key returns 409 Conflict
+            resp2 = self.client.post("/pipeline/post-to-linkedin", json=payload, headers=headers)
+            self.assertEqual(resp2.status_code, 409)
+            self.assertIn("Conflict", resp2.get_json().get("error", ""))
+
+    def test_idempotency_key_in_header_accepted(self):
+        """Idempotency-Key supplied in HTTP headers is respected."""
+        headers = {
+            "Authorization": f"Bearer {self.test_token}",
+            "Idempotency-Key": "header-key-98765",
+        }
+        with patch("api.app.LinkedInPoster") as mock_poster:
+            instance = mock_poster.return_value
+            instance.create_text_post.return_value = "urn:li:share:header_post_1"
+
+            resp = self.client.post(
+                "/pipeline/post-to-linkedin",
+                json={"text": "Header key post"},
+                headers=headers,
+            )
+            self.assertEqual(resp.status_code, 200)
+            self.assertEqual(resp.get_json().get("idempotency_key"), "header-key-98765")
 
     def test_duplicate_webhook_rejected_with_409(self):
         """A second request for the same HN story must return HTTP 409 Conflict."""

@@ -151,30 +151,60 @@ def fetch_and_generate():
 def post_to_linkedin():
     """Post approved content to LinkedIn with atomic idempotency protection."""
     data = request.get_json(silent=True)
-    if not data or "text" not in data:
-        return jsonify({"error": "Missing 'text' field"}), 400
+    if not data or "text" not in data or not str(data["text"]).strip():
+        return jsonify({"error": "Missing or empty 'text' field"}), 400
 
-    text = data["text"]
+    text = str(data["text"]).strip()
     article_url = data.get("article_url", "")
     article_title = data.get("article_title", "")
-    hn_id = int(data.get("hn_id", 0) or 0)
     hn_title = data.get("hn_title", "")
+
+    # 1. Validate incoming publication identifier (Fix M-1)
+    raw_hn_id = data.get("hn_id")
+    idempotency_key = (
+        request.headers.get("Idempotency-Key")
+        or request.headers.get("X-Idempotency-Key")
+        or data.get("idempotency_key")
+    )
+
+    hn_id = None
+    if raw_hn_id is not None:
+        try:
+            hn_id = int(raw_hn_id)
+            if hn_id <= 0:
+                return jsonify({"error": "Invalid 'hn_id': Must be a positive integer."}), 400
+        except (ValueError, TypeError):
+            return jsonify({"error": "Invalid 'hn_id': Must be a positive integer."}), 400
+
+    # If neither hn_id nor idempotency_key is provided, fail closed
+    if hn_id is None and not idempotency_key:
+        return jsonify({
+            "error": "Missing publication identifier: Must provide a positive 'hn_id' or an 'idempotency_key' (via body or Idempotency-Key header)."
+        }), 400
+
+    if idempotency_key:
+        idempotency_key = str(idempotency_key).strip()
+        if not idempotency_key or len(idempotency_key) > 255:
+            return jsonify({"error": "Invalid 'idempotency_key': Must be a non-empty string under 256 characters."}), 400
+    else:
+        idempotency_key = f"hn:{hn_id}"
 
     tracker = HistoryTracker()
 
-    # If story ID is provided, atomically claim the story before publishing
-    if hn_id > 0:
-        claimed, reason = tracker.claim_story_for_publishing(
-            hn_id=hn_id,
-            title=hn_title or article_title,
-            url=article_url,
-        )
-        if not claimed:
-            return jsonify({
-                "error": f"Conflict: Story {hn_id} has already been published or is currently being processed.",
-                "status": reason,
-                "hn_id": hn_id,
-            }), 409
+    # 2. Atomically claim idempotency key before calling LinkedIn
+    claimed, reason = tracker.claim_idempotency_key(
+        idempotency_key=idempotency_key,
+        hn_id=hn_id,
+        title=hn_title or article_title,
+        url=article_url,
+    )
+    if not claimed:
+        return jsonify({
+            "error": f"Conflict: Post identifier '{idempotency_key}' has already been published or is currently being processed.",
+            "status": reason,
+            "idempotency_key": idempotency_key,
+            "hn_id": hn_id,
+        }), 409
 
     poster = LinkedInPoster()
     post_urn = None
@@ -185,30 +215,43 @@ def post_to_linkedin():
         else:
             post_urn = poster.create_text_post(text)
     except LinkedInTimeoutError as e:
-        if hn_id > 0:
-            tracker.mark_story_uncertain(hn_id, f"LinkedIn request timed out: {e}")
+        tracker.mark_claim_uncertain(idempotency_key, f"LinkedIn request timed out: {e}", hn_id=hn_id)
         return jsonify({
             "error": "Gateway Timeout: LinkedIn posting request timed out. Marked for reconciliation to prevent duplicate publishing.",
             "status": "reconciliation_needed",
+            "idempotency_key": idempotency_key,
             "hn_id": hn_id,
         }), 504
     except Exception as e:
-        if hn_id > 0:
-            tracker.mark_story_failed(hn_id, f"LinkedIn posting failed: {e}")
+        tracker.mark_claim_failed(idempotency_key, f"LinkedIn posting failed: {e}", hn_id=hn_id)
         return jsonify({
             "error": f"Publishing failed: {e}",
+            "idempotency_key": idempotency_key,
             "hn_id": hn_id,
         }), 500
 
     if post_urn:
-        if hn_id > 0:
-            tracker.mark_story_published(hn_id, hn_title or article_title, article_url, post_urn)
-        return jsonify({"status": "posted", "post_urn": post_urn, "hn_id": hn_id})
+        tracker.mark_claim_published(
+            idempotency_key=idempotency_key,
+            linkedin_post_urn=post_urn,
+            hn_id=hn_id,
+            title=hn_title or article_title,
+            url=article_url,
+        )
+        return jsonify({
+            "status": "posted",
+            "post_urn": post_urn,
+            "idempotency_key": idempotency_key,
+            "hn_id": hn_id,
+        })
 
     # Definite non-timeout failure
-    if hn_id > 0:
-        tracker.mark_story_failed(hn_id, "LinkedIn UGC API post creation failed")
-    return jsonify({"error": "Failed to post to LinkedIn", "hn_id": hn_id}), 500
+    tracker.mark_claim_failed(idempotency_key, "LinkedIn UGC API post creation failed", hn_id=hn_id)
+    return jsonify({
+        "error": "Failed to post to LinkedIn",
+        "idempotency_key": idempotency_key,
+        "hn_id": hn_id,
+    }), 500
 
 
 if __name__ == "__main__":

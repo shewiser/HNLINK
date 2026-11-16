@@ -19,6 +19,7 @@ from typing import Optional, Tuple
 import requests
 
 from config.settings import settings
+from src.credential_store import SecureCredentialStore
 
 logger = logging.getLogger(__name__)
 
@@ -41,12 +42,16 @@ class LinkedInPoster:
         self,
         access_token: Optional[str] = None,
         person_urn: Optional[str] = None,
+        credential_store: Optional[SecureCredentialStore] = None,
     ):
-        self.access_token = access_token or settings.linkedin_access_token
+        self.credential_store = credential_store or SecureCredentialStore()
+        stored_creds = self.credential_store.load_credentials()
+
+        self.access_token = access_token or stored_creds.get("access_token") or settings.linkedin_access_token
         self.person_urn = person_urn or settings.linkedin_person_urn
         self.client_id = settings.linkedin_client_id
         self.client_secret = settings.linkedin_client_secret
-        self.refresh_token = settings.linkedin_refresh_token
+        self.refresh_token = stored_creds.get("refresh_token") or settings.linkedin_refresh_token
 
         self.session = requests.Session()
         self._update_session_headers()
@@ -98,16 +103,29 @@ class LinkedInPoster:
             if resp.status_code == 200:
                 data = resp.json()
                 new_token = data.get("access_token")
+                new_refresh = data.get("refresh_token")
                 if new_token:
+                    effective_refresh = new_refresh if new_refresh else self.refresh_token
+                    # Persist rotated credentials to secure credential store
+                    saved, err = self.credential_store.save_credentials(
+                        access_token=new_token,
+                        refresh_token=effective_refresh,
+                    )
+                    if not saved:
+                        logger.error("Failed to securely persist refreshed credentials: %s", err)
+                        return (
+                            False,
+                            f"OAuth token refresh succeeded, but rotated credentials could not be securely persisted ({err}). "
+                            "Reauthorization required to prevent using an unpersisted token."
+                        )
+
                     self.access_token = new_token
                     self._update_session_headers()
-                    # Capture rotated refresh token if provided
-                    new_refresh = data.get("refresh_token")
                     if new_refresh:
                         self.refresh_token = new_refresh
                         settings.linkedin_refresh_token = new_refresh
-                        logger.info("LinkedIn refresh token rotated and updated successfully")
-                    logger.info("Successfully refreshed LinkedIn OAuth access token")
+                        logger.info("LinkedIn refresh token rotated and persisted securely")
+                    logger.info("Successfully refreshed and persisted LinkedIn OAuth credentials")
                     return (True, "Access token refreshed successfully")
             error_desc = resp.json().get("error_description", resp.text) if resp.content else "Unknown error"
             return (False, f"Token refresh failed ({resp.status_code}): {error_desc}")

@@ -1,5 +1,5 @@
 """
-Tests for SQLite HistoryTracker and Persistent Pending Approvals.
+Tests for SQLite HistoryTracker, Persistent Pending Approvals, and Idempotency Claims.
 
 Verifies:
 - Configurable database path via HN_LINK_DB_PATH.
@@ -12,16 +12,26 @@ Verifies:
 - Explicit connection closure to prevent handle leaks.
 - Transaction rollback on unhandled exceptions.
 - Concurrent atomic story claims across threads.
+- Input bounds truncation on malformed/oversized titles and URLs (Fix L-1).
+- Persistent idempotency claims table uniqueness and lifecycle (Fix M-1).
+- SecureCredentialStore permissions and encryption-at-rest (Fix M-2).
 """
 
 from concurrent.futures import ThreadPoolExecutor
 import os
 import shutil
 import sqlite3
+import stat
 import tempfile
 import unittest
 
-from src.history_tracker import HistoryTracker
+from src.credential_store import SecureCredentialStore
+from src.history_tracker import (
+    HistoryTracker,
+    MAX_TITLE_CHARS,
+    MAX_URL_CHARS,
+    MAX_POST_TEXT_CHARS,
+)
 
 
 class TestDatabaseSecurity(unittest.TestCase):
@@ -149,12 +159,10 @@ class TestDatabaseSecurity(unittest.TestCase):
 
     def test_connection_closure_and_resource_cleanup(self):
         """Executing database operations must explicitly close connection handles."""
-        # Execute multiple queries
         for i in range(25):
             self.tracker.is_posted(i)
             self.tracker.get_pending_post(f"dummy_{i}")
 
-        # Verify database is not left in a locked state
         is_valid, msg = self.tracker.check_integrity()
         self.assertTrue(is_valid, msg)
 
@@ -171,7 +179,6 @@ class TestDatabaseSecurity(unittest.TestCase):
         except RuntimeError:
             pass
 
-        # Record must NOT exist due to rollback
         self.assertFalse(self.tracker.is_posted(hn_id))
 
     def test_concurrent_atomic_story_claims(self):
@@ -191,6 +198,101 @@ class TestDatabaseSecurity(unittest.TestCase):
 
         success_count = sum(1 for success, _ in results if success)
         self.assertEqual(success_count, 1, f"Expected 1 claim success, got {success_count}: {results}")
+
+    def test_long_and_malformed_story_metadata_truncated(self):
+        """Oversized story titles and URLs must be safely bounded to prevent database bloat (Fix L-1)."""
+        huge_title = "A" * 5000
+        huge_url = "https://example.com/" + ("x" * 10000)
+        huge_text = "Post content " * 5000
+
+        self.tracker.save_pending_post(
+            post_id="post_oversized_1",
+            hn_id=66666,
+            title=huge_title,
+            url=huge_url,
+            score=10,
+            comments=2,
+            linkedin_text=huge_text,
+        )
+
+        post = self.tracker.get_pending_post("post_oversized_1")
+        self.assertIsNotNone(post)
+        self.assertLessEqual(len(post["hn_title"]), MAX_TITLE_CHARS)
+        self.assertLessEqual(len(post["hn_url"]), MAX_URL_CHARS)
+        self.assertLessEqual(len(post["linkedin_text"]), MAX_POST_TEXT_CHARS)
+
+    def test_idempotency_claims_unique_constraint_and_lifecycle(self):
+        """Idempotency claims table guarantees unique constraint across publications (Fix M-1)."""
+        key = "unique-claim-key-12345"
+
+        # 1. Claim succeeds
+        claimed, status = self.tracker.claim_idempotency_key(
+            idempotency_key=key,
+            hn_id=44444,
+            title="Claimed Story",
+            url="https://example.com/claim",
+        )
+        self.assertTrue(claimed)
+        self.assertEqual(status, "claimed")
+
+        # 2. Duplicate claim attempt for active publishing is rejected
+        claimed_dup, status_dup = self.tracker.claim_idempotency_key(idempotency_key=key)
+        self.assertFalse(claimed_dup)
+        self.assertEqual(status_dup, "publishing")
+
+        # 3. Transition to published
+        published = self.tracker.mark_claim_published(
+            idempotency_key=key,
+            linkedin_post_urn="urn:li:share:claim_urn_1",
+            hn_id=44444,
+        )
+        self.assertTrue(published)
+
+        claim_rec = self.tracker.get_claim(key)
+        self.assertEqual(claim_rec["status"], "published")
+        self.assertEqual(claim_rec["linkedin_post_urn"], "urn:li:share:claim_urn_1")
+
+        # 4. Duplicate claim after publication is rejected
+        claimed_after, status_after = self.tracker.claim_idempotency_key(idempotency_key=key)
+        self.assertFalse(claimed_after)
+        self.assertEqual(status_after, "published")
+
+    def test_secure_credential_store_encryption_and_permissions(self):
+        """SecureCredentialStore restricts permissions to 0600 and validates encryption (Fix M-2)."""
+        cred_file = os.path.join(self.temp_dir, "test_secret_creds.json")
+        orig_key = os.environ.get("HN_LINK_ENCRYPTION_KEY")
+        try:
+            os.environ["HN_LINK_ENCRYPTION_KEY"] = "my-secret-test-encryption-key-32b"
+            store = SecureCredentialStore(store_path=cred_file)
+
+            saved, err = store.save_credentials(
+                access_token="test_access_token_abc",
+                refresh_token="test_refresh_token_xyz",
+            )
+            self.assertTrue(saved, f"Saving failed: {err}")
+            self.assertTrue(os.path.exists(cred_file))
+
+            # Verify file permissions on POSIX (0600)
+            file_stat = os.stat(cred_file)
+            mode = stat.S_IMODE(file_stat.st_mode)
+            self.assertEqual(mode, 0o600, f"Expected 0600 mode, got {oct(mode)}")
+
+            # Verify contents are encrypted (no plaintext tokens)
+            with open(cred_file, "r", encoding="utf-8") as f:
+                content = f.read()
+            self.assertNotIn("test_access_token_abc", content)
+            self.assertNotIn("test_refresh_token_xyz", content)
+
+            # Verify decryption on load
+            loaded = store.load_credentials()
+            self.assertEqual(loaded.get("access_token"), "test_access_token_abc")
+            self.assertEqual(loaded.get("refresh_token"), "test_refresh_token_xyz")
+
+        finally:
+            if orig_key is not None:
+                os.environ["HN_LINK_ENCRYPTION_KEY"] = orig_key
+            else:
+                os.environ.pop("HN_LINK_ENCRYPTION_KEY", None)
 
 
 if __name__ == "__main__":

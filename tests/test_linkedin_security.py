@@ -8,14 +8,19 @@ Verifies:
 - HTTP 401 triggers automated refresh when configured.
 - HTTP 400, 403, 429, 5xx do NOT trigger token refresh.
 - Network timeouts raise LinkedInTimeoutError for ambiguous outcome handling.
-- Refresh token rotation persistence.
+- Refresh token rotation persistence across application restarts.
+- Refresh persistence failure fails safely.
 """
 
+import os
+import shutil
+import tempfile
 import unittest
 from unittest.mock import MagicMock, patch
 
 import requests
 
+from src.credential_store import SecureCredentialStore
 from src.linkedin_poster import LinkedInPoster, LinkedInTimeoutError
 
 
@@ -80,6 +85,77 @@ class TestLinkedInSecurity(unittest.TestCase):
         self.assertEqual(poster.access_token, "new_refreshed_token_xyz")
         # Rotated refresh token must be captured and persisted
         self.assertEqual(poster.refresh_token, "new_rotated_refresh_token_abc")
+
+    @patch("requests.post")
+    def test_refreshed_credentials_persisted_across_restarts(self, mock_oauth_post):
+        """Refreshed and rotated tokens survive an application restart."""
+        temp_dir = tempfile.mkdtemp()
+        cred_file = os.path.join(temp_dir, "test_creds.json")
+        try:
+            store = SecureCredentialStore(store_path=cred_file)
+            mock_resp = MagicMock()
+            mock_resp.status_code = 200
+            mock_resp.json.return_value = {
+                "access_token": "persisted_access_token_123",
+                "refresh_token": "persisted_rotated_refresh_token_456",
+            }
+            mock_oauth_post.return_value = mock_resp
+
+            # Session 1: Performs refresh
+            poster1 = LinkedInPoster(
+                access_token="initial_token",
+                person_urn="urn:li:person:abcdef",
+                credential_store=store,
+            )
+            poster1.refresh_token = "initial_refresh_token"
+            poster1.client_id = "test_client_id"
+            poster1.client_secret = "test_client_secret"
+
+            success, msg = poster1.refresh_access_token()
+            self.assertTrue(success)
+
+            # Session 2: Simulates app restart with new poster instance pointing to same store
+            store2 = SecureCredentialStore(store_path=cred_file)
+            poster2 = LinkedInPoster(
+                access_token="",
+                person_urn="urn:li:person:abcdef",
+                credential_store=store2,
+            )
+            self.assertEqual(poster2.access_token, "persisted_access_token_123")
+            self.assertEqual(poster2.refresh_token, "persisted_rotated_refresh_token_456")
+        finally:
+            shutil.rmtree(temp_dir, ignore_errors=True)
+
+    @patch("requests.post")
+    def test_refresh_persistence_failure_fails_safely(self, mock_oauth_post):
+        """When credentials cannot be saved to persistent store, refresh fails safely."""
+        mock_store = MagicMock()
+        mock_store.load_credentials.return_value = {}
+        mock_store.save_credentials.return_value = (False, "Permission denied / disk full")
+
+        mock_resp = MagicMock()
+        mock_resp.status_code = 200
+        mock_resp.json.return_value = {
+            "access_token": "new_token",
+            "refresh_token": "new_rotated_refresh",
+        }
+        mock_oauth_post.return_value = mock_resp
+
+        poster = LinkedInPoster(
+            access_token="old_token",
+            person_urn="urn:li:person:abcdef",
+            credential_store=mock_store,
+        )
+        poster.refresh_token = "old_refresh"
+        poster.client_id = "test_client_id"
+        poster.client_secret = "test_client_secret"
+
+        success, msg = poster.refresh_access_token()
+        self.assertFalse(success)
+        self.assertIn("could not be securely persisted", msg)
+        # Token must NOT be updated in memory to an unpersisted state
+        self.assertEqual(poster.access_token, "old_token")
+        self.assertEqual(poster.refresh_token, "old_refresh")
 
     @patch("requests.Session.post")
     @patch.object(LinkedInPoster, "refresh_access_token")

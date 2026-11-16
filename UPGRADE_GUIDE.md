@@ -15,9 +15,10 @@ Upgrading preserves all existing posting history, but requires updating configur
 ## ⚠️ Breaking Changes & Upgrades Checklist
 
 1. **Telegram Allowlist**: You must configure `TELEGRAM_ALLOWED_USERS` in your `.env`. If this variable is omitted or empty, all incoming Telegram messages and callbacks fail closed (rejected).
-2. **Flask API Authentication**: The endpoints `/pipeline/fetch-and-generate` and `/pipeline/post-to-linkedin` require a Bearer token or `X-API-Key` header matching `HN_LINK_API_KEY` or `N8N_WEBHOOK_TOKEN`. Query parameter tokens (`?token=...`) are no longer permitted.
+2. **Flask API Authentication & Required Identifiers**: The endpoints `/pipeline/fetch-and-generate` and `/pipeline/post-to-linkedin` require a Bearer token or `X-API-Key` header matching `HN_LINK_API_KEY` or `N8N_WEBHOOK_TOKEN`. Query parameter tokens (`?token=...`) are no longer permitted. Additionally, `POST /pipeline/post-to-linkedin` requires either a positive integer `hn_id` or an `idempotency_key`. Submissions without a valid identifier return `HTTP 400 Bad Request`.
 3. **CLI Arguments**: The flags `--publish` and `--dry-run` are now mutually exclusive. Omitting both flags defaults to safe dry-run mode. Passing both will result in an argument error.
-4. **API Idempotency Codes**: Replaying `POST /pipeline/post-to-linkedin` with the same `hn_id` now returns `HTTP 409 Conflict`. External timeouts return `HTTP 504 Gateway Timeout`.
+4. **API Idempotency Codes**: Replaying `POST /pipeline/post-to-linkedin` with the same `hn_id` or `idempotency_key` returns `HTTP 409 Conflict`. External timeouts return `HTTP 504 Gateway Timeout`.
+5. **Persistent Credential Storage**: Rotated LinkedIn OAuth tokens are stored in `.credentials_store.json` (permissions `0600`). You can set `HN_LINK_ENCRYPTION_KEY` in `.env` to enable authenticated HMAC-SHA256 encryption at rest.
 
 ---
 
